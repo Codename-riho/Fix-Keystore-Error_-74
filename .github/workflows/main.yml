@@ -1,0 +1,180 @@
+name: Build RKP Server Overlay Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      rkp_url:
+        description: 'Endpoint URL Server RKP'
+        required: true
+        default: 'https://remoteprovisioning.googleapis.com/v1'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/build-rkp-overlay.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_RKP_URL: https://remoteprovisioning.googleapis.com/v1
+
+jobs:
+  build-overlay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Siapkan Sumber RRO & Struktur Module KernelSU
+        env:
+          INPUT_RKP_URL: ${{ github.event.inputs.rkp_url }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          RKP_URL="${INPUT_RKP_URL:-$DEFAULT_RKP_URL}"
+
+          # Validasi: harus https:// dan tanpa spasi/baris baru
+          if [[ ! "$RKP_URL" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::error::rkp_url harus diawali https:// dan tidak boleh mengandung spasi: '$RKP_URL'"
+            exit 1
+          fi
+
+          # Escape karakter khusus XML agar URL dengan query (&, <, >) tidak merusak config.xml
+          # (pakai sed: di bash 5.2 '&' pada string pengganti ${var//x/&y} berarti "teks yang cocok")
+          RKP_URL_XML=$(printf '%s' "$RKP_URL" |
+            sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
+
+          mkdir -p work/src/res/values
+          mkdir -p work/module/system/product/overlay/RkpdAppOverlay
+
+          cat << 'EOF' > work/src/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.android.rkpdapp.overlay.topaz">
+              <overlay
+                  android:targetPackage="com.android.rkpdapp"
+                  android:isStatic="true"
+                  android:priority="100" />
+              <application android:hasCode="false" />
+          </manifest>
+          EOF
+
+          cat << EOF > work/src/res/values/config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="rkpd_server_url" translatable="false">${RKP_URL_XML}</string>
+          </resources>
+          EOF
+
+          # versionCode naik di tiap build agar manager mengenali pembaruan
+          cat << EOF > work/module/module.prop
+          id=rkpd_server_overlay
+          name=RKP Server URL Overlay
+          version=v1.0.${RUN_NUMBER}
+          versionCode=${RUN_NUMBER}
+          author=Dyatz
+          description=Static RRO overlay to configure Google RKP server URL for com.android.rkpdapp
+          EOF
+
+          cat << 'EOF' > work/module/service.sh
+          #!/system/bin/sh
+          # Tunggu boot selesai, maksimal ~5 menit agar tidak menggantung selamanya
+          i=0
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do
+            i=$((i + 1))
+            [ "$i" -ge 150 ] && exit 0
+            sleep 2
+          done
+          resetprop persist.device_config.remote_key_provisioning_native.enable_rkpd true
+          cmd device_config put remote_key_provisioning_native enable_rkpd true
+          cmd overlay enable --user 0 com.android.rkpdapp.overlay.topaz 2>/dev/null
+          EOF
+          chmod 755 work/module/service.sh
+
+          # Pastikan file XML hasil generate valid sebelum dikompilasi
+          python3 -c "import sys, xml.dom.minidom as m; [m.parse(f) for f in sys.argv[1:]]" \
+            work/src/AndroidManifest.xml work/src/res/values/config.xml
+
+      - name: Compile & Sign RRO APK dengan Android SDK Runner
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          AAPT2=$(find "$SDK_ROOT/build-tools" -name "aapt2" -type f | sort -V | tail -n 1)
+          APKSIGNER=$(find "$SDK_ROOT/build-tools" -name "apksigner" -type f | sort -V | tail -n 1)
+          ANDROID_JAR=$(find "$SDK_ROOT/platforms" -name "android.jar" -type f | sort -V | tail -n 1)
+
+          for v in AAPT2 APKSIGNER ANDROID_JAR; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v tidak ditemukan di $SDK_ROOT"
+              exit 1
+            fi
+            echo "Using $v: ${!v}"
+          done
+
+          # Keystore sekali pakai dengan password acak (tidak ada kredensial hardcoded)
+          STORE_PASS=$(openssl rand -hex 16)
+          echo "::add-mask::$STORE_PASS"
+          export STORE_PASS
+
+          APK_OUT=work/module/system/product/overlay/RkpdAppOverlay/RkpdAppOverlay.apk
+
+          "$AAPT2" compile --dir work/src/res -o work/compiled_res.zip
+          "$AAPT2" link -o work/RkpdAppOverlay.unsigned.apk \
+            -I "$ANDROID_JAR" \
+            --manifest work/src/AndroidManifest.xml \
+            work/compiled_res.zip
+
+          keytool -genkeypair -keystore work/rkp.keystore \
+            -storepass:env STORE_PASS -keypass:env STORE_PASS \
+            -alias rkpoverlay -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=RKP Overlay,O=Android,C=ID"
+
+          "$APKSIGNER" sign \
+            --v4-signing-enabled false \
+            --ks work/rkp.keystore \
+            --ks-pass env:STORE_PASS \
+            --ks-key-alias rkpoverlay \
+            --key-pass env:STORE_PASS \
+            --out "$APK_OUT" \
+            work/RkpdAppOverlay.unsigned.apk
+
+          "$APKSIGNER" verify --verbose "$APK_OUT"
+          "$AAPT2" dump badging "$APK_OUT" | head -n 1
+
+          # Kunci privat tidak ikut ke module/artifact
+          rm -f work/rkp.keystore work/RkpdAppOverlay.unsigned.apk work/compiled_res.zip
+
+      - name: Kemas Module KernelSU (ZIP)
+        run: |
+          set -euo pipefail
+
+          # Permission seragam agar isi ZIP konsisten antar build
+          find work/module -type d -exec chmod 755 {} +
+          find work/module -type f ! -name service.sh -exec chmod 644 {} +
+
+          (cd work/module && zip -qr9X ../../RKP-Server-Overlay.zip .)
+          unzip -l RKP-Server-Overlay.zip
+
+          {
+            echo "### RKP Server Overlay"
+            echo "- Versi: v1.0.${{ github.run_number }}"
+            echo "- SHA-256: \`$(sha256sum RKP-Server-Overlay.zip | cut -d' ' -f1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Artifact RKP-Server-Overlay.zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: RKP-Server-Overlay
+          path: RKP-Server-Overlay.zip
+          if-no-files-found: error
+          
